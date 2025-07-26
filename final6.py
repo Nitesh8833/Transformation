@@ -4,7 +4,10 @@ provider_location_pipeline.py
 Builds “Provider_Locations_Final” with:
 • header‑scan metadata
 • duplicate‑header protection
+• UPPERCASE name matching
+• Middle‑Name repair from Grid (and adopt Grid FN/LN when found)
 • synonym‑aware fallback merge (ER ⇔ Emergency‑Room, Surg ⇔ Surgery, OR)
+• if multiple address fingerprint hits → take the first
 • M/D/YYYY date columns
 """
 
@@ -16,6 +19,12 @@ import pandas as pd, re, platform
 # ───────────────────────── HEADER‑SCAN HELPER ─────────────────────────
 def get_header_meta(path: Path | str,
                     sheet: str = "BMH Locations") -> dict[str, str | None]:
+    """
+    Read the 'BMH Locations' sheet without headers and fetch:
+      CAQH Grp ID / TIN / BILLING / MEDICAID BOX
+    from the block above the real header row.
+    Works if the value is after ':' in the same cell or somewhere to the right.
+    """
     df = pd.read_excel(path, sheet_name=sheet, header=None, dtype=str)
     hdr_idx = df.eq("Street Address").any(axis=1).idxmax()
     top = df.iloc[:hdr_idx]
@@ -34,10 +43,12 @@ def get_header_meta(path: Path | str,
             cell = top.iat[r, c]
             if pd.isna(cell):
                 continue
-            txt, up = str(cell).strip(), str(cell).strip().upper()
+            txt = str(cell).strip()
+            up  = txt.upper()
 
             if up.startswith("CAQH GRP ID") and not meta["CAQH Grp ID"]:
-                meta["CAQH Grp ID"] = re.search(r"\d+", txt).group(0) if re.search(r"\d+", txt) else right_of(r, c)
+                m = re.search(r"\d+", txt)
+                meta["CAQH Grp ID"] = m.group(0) if m else right_of(r, c)
             elif up.startswith("TIN") and not meta["TIN"]:
                 m = re.search(r"TIN\s*[:\s]*([0-9\-]+)", txt, re.I)
                 meta["TIN"] = m.group(1) if m else right_of(r, c)
@@ -47,6 +58,7 @@ def get_header_meta(path: Path | str,
             elif up.startswith("MEDICAID BOX") and not meta["MEDICAID BOX"]:
                 after = txt.split(":", 1)[1].strip() if ":" in txt else ""
                 meta["MEDICAID BOX"] = after or right_of(r, c)
+
     return meta
 
 
@@ -60,7 +72,7 @@ class ProviderLocationPipeline:
 
         self.output_dir  = self.input_xlsx.parent / "output"
         self.output_dir.mkdir(exist_ok=True)
-        self.output_xlsx = self.output_dir / "provider_locations_final6.xlsx"
+        self.output_xlsx = self.output_dir / "provider_locations_final.xlsx"
         self._sheets: dict[str, pd.DataFrame] = {}
 
     # ─── helpers ───
@@ -70,11 +82,12 @@ class ProviderLocationPipeline:
 
     @staticmethod
     def _dedup_columns(cols):
+        """Rename duplicates to Name, Name_1, Name_2, …"""
         seen, out = {}, []
         for col in cols:
-            k = seen.get(col, 0)
-            out.append(col if k == 0 else f"{col}_{k}")
-            seen[col] = k + 1
+            n = seen.get(col, 0)
+            out.append(col if n == 0 else f"{col}_{n}")
+            seen[col] = n + 1
         return out
 
     def _load(self, sheet: str) -> pd.DataFrame:
@@ -87,13 +100,13 @@ class ProviderLocationPipeline:
         "operatingroom": "or", "or": "or",
         "er": "er", "emergencyroom": "er"
     }
-
     @classmethod
     def _norm_word(cls, w: str) -> str:
         key = re.sub(r"[^a-z0-9]", "", w.lower())
         return cls._WORD_MAP.get(key, key)
 
     def _fmt_date_cols(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Format Start Date, DOB, License Exp, DEA Exp → M/D/YYYY (no leading zeros)."""
         fmt = '%#m/%#d/%Y' if platform.system() == "Windows" else '%-m/%-d/%Y'
         for col in {"Start Date", "DOB", "License Exp", "DEA Exp"} & set(df.columns):
             df[col] = (pd.to_datetime(df[col], errors='coerce')
@@ -114,6 +127,53 @@ class ProviderLocationPipeline:
             loc[k] = v
         return loc.reset_index(drop=True)
 
+    # ─── helper: repair names from Grid ───
+    def _repair_names_from_grid(self, merged: pd.DataFrame, grid: pd.DataFrame) -> pd.DataFrame:
+        """
+        If merged['Middle Name'] is blank, try to pull First/Last/Middle from Grid
+        using substring + swapped-name logic. Overwrite First/Last with Grid's
+        values when a match is found (e.g., HARPER-ALLEN / MELANIE / LEA).
+        """
+        def _norm_letters(s: str) -> str:
+            return re.sub(r"[^A-Z]", "", str(s).upper())
+
+        g = grid[["First Name", "Last Name", "Middle Name"]].copy()
+        g["FN_UP"]   = g["First Name"].astype(str).str.strip().str.upper()
+        g["LN_UP"]   = g["Last Name"].astype(str).str.strip().str.upper()
+        g["FN_NORM"] = g["FN_UP"].map(_norm_letters)
+        g["LN_NORM"] = g["LN_UP"].map(_norm_letters)
+
+        merged["First Name"]  = merged["First Name"].astype(str).str.strip().str.upper()
+        merged["Last Name"]   = merged["Last Name"].astype(str).str.strip().str.upper()
+        merged["Middle Name"] = merged["Middle Name"].fillna("")
+
+        need_middle = merged["Middle Name"].eq("")
+        for i in merged.index[need_middle]:
+            fn = merged.at[i, "First Name"]   # e.g., MELANIE
+            ln = merged.at[i, "Last Name"]    # e.g., ALLEN
+            fnN = _norm_letters(fn)
+            lnN = _norm_letters(ln)
+
+            # A) Grid LAST == roster FIRST AND roster LAST appears in Grid FIRST (HARPER-ALLEN contains ALLEN)
+            cand = g[(g["LN_UP"] == fn) & (g["FN_NORM"].str.contains(lnN, na=False))]
+
+            # B) reverse relationship
+            if cand.empty:
+                cand = g[(g["FN_UP"] == ln) & (g["LN_NORM"].str.contains(fnN, na=False))]
+
+            # C) looser: both roster names appear somewhere across Grid FIRST/LAST (normalized)
+            if cand.empty:
+                cand = g[g["FN_NORM"].str.contains(fnN, na=False) & g["LN_NORM"].str.contains(lnN, na=False)]
+
+            if not cand.empty:
+                cand = cand.sort_values(by=cand["FN_UP"].str.len(), ascending=False)
+                row = cand.iloc[0]
+                merged.at[i, "First Name"]  = str(row["First Name"]).strip().upper()
+                merged.at[i, "Last Name"]   = str(row["Last Name"]).strip().upper()
+                merged.at[i, "Middle Name"] = str(row["Middle Name"] or "").strip().upper()
+
+        return merged
+
     # ─── stage 2 – provider rows ───
     def _build_provider_rows(self) -> pd.DataFrame:
         GRID = [
@@ -127,9 +187,10 @@ class ProviderLocationPipeline:
         roster = self._load("BMH Provider Roster").copy()
         grid   = self._load("BMH Provider Location Grid").copy()
 
+        # 🔠 Force FIRST/LAST UPPERCASE for both sheets before merge
         for df in (roster, grid):
-            df["Last Name"]  = df["Last Name"].map(self._clean)
-            df["First Name"] = df["First Name"].map(self._clean)
+            df["Last Name"]  = df["Last Name"].astype(str).str.strip().str.upper()
+            df["First Name"] = df["First Name"].astype(str).str.strip().str.upper()
         grid["Middle Name"] = grid["Middle Name"].map(self._clean)
 
         aff_df = (grid[["Last Name","First Name","BMH Phys Grp"]]
@@ -144,51 +205,10 @@ class ProviderLocationPipeline:
             on=["Last Name","First Name"], how="left",
         )
 
-        # ── Middle Name fallback (substring + swapped-name matching) ──
-        def _norm_letters(s: str) -> str:
-            return re.sub(r"[^A-Z]", "", str(s).upper())
+        # 🧩 Repair missing middle names (and adopt Grid FN/LN) when needed
+        merged = self._repair_names_from_grid(merged, grid)
 
-        grid_norm = grid[["First Name", "Last Name", "Middle Name"]].copy()
-        grid_norm["FN_UP"]   = grid_norm["First Name"].astype(str).str.strip().str.upper()
-        grid_norm["LN_UP"]   = grid_norm["Last Name"].astype(str).str.strip().str.upper()
-        grid_norm["FN_NORM"] = grid_norm["FN_UP"].map(_norm_letters)
-        grid_norm["LN_NORM"] = grid_norm["LN_UP"].map(_norm_letters)
-
-        merged["Middle Name"] = merged["Middle Name"].fillna("")
-        merged["First Name"]  = merged["First Name"].astype(str).str.strip().str.upper()
-        merged["Last Name"]   = merged["Last Name"].astype(str).str.strip().str.upper()
-
-        need_middle = merged["Middle Name"].eq("")
-        for i in merged.index[need_middle]:
-            fn = merged.at[i, "First Name"]   # e.g., MELANIE
-            ln = merged.at[i, "Last Name"]    # e.g., ALLEN
-            fnN = _norm_letters(fn)
-            lnN = _norm_letters(ln)
-
-            # Case A: Grid LAST == roster FIRST AND roster LAST is inside Grid FIRST (handles HARPER-ALLEN)
-            cand = grid_norm[
-                (grid_norm["LN_UP"] == fn) &
-                (grid_norm["FN_NORM"].str.contains(lnN, na=False))
-            ]
-
-            # Case B: reverse relationship
-            if cand.empty:
-                cand = grid_norm[
-                    (grid_norm["FN_UP"] == ln) &
-                    (grid_norm["LN_NORM"].str.contains(fnN, na=False))
-                ]
-
-            # Case C: looser — both roster names appear in grid FN/LN (normalized)
-            if cand.empty:
-                cand = grid_norm[
-                    grid_norm["FN_NORM"].str.contains(fnN, na=False) &
-                    grid_norm["LN_NORM"].str.contains(lnN, na=False)
-                ]
-
-            if not cand.empty:
-                merged.at[i, "Middle Name"] = str(cand.iloc[0]["Middle Name"] or "").strip()
-
-        # ── explode to primary + covering rows ──
+        # explode to primary + covering rows
         rows = []
         for _, r in merged.iterrows():
             base = {"Last Name": r["Last Name"], "First Name": r["First Name"],
@@ -214,23 +234,20 @@ class ProviderLocationPipeline:
     # ---------- MERGE & POLISH ----------
     def _build_final(self, prov: pd.DataFrame, loc: pd.DataFrame) -> pd.DataFrame:
         """
-        • 1️⃣ exact merge  Location ↔ LOC DBA NAME
-        • 2️⃣ for rows still missing Street Address:
-              a. address fingerprint candidates
-              b. reduce by synonym‑normalised words from Location
-              c. if 1 → use it; if 0 or >1 → use first fingerprint hit
-              d. if no fingerprint hits → naive substring fallback
-        • 3️⃣ dedup headers, format dates, move affiliation last
+        1) exact merge  Location ↔ LOC DBA NAME
+        2) fill blanks via fingerprint + synonym words; if ties → first fp hit;
+           if no fp hit → substring fallback
+        3) dedup headers, format dates, move affiliation last
         """
-        # 1️⃣ exact merge
+        # 1) exact merge
         final = prov.merge(
             loc, left_on="Location", right_on="LOC DBA NAME",
             how="left", suffixes=("", "_loc")
         ).drop(columns=["LOC DBA NAME"])
 
-        # 2️⃣ fill blanks via fingerprint/word/substring
+        # 2) fill blanks via fingerprint/word/substring
         addr_cols = [c for c in loc.columns if c not in prov.columns]
-        fp = lambda s: re.sub(r"[^a-z0-9]", "", str(s).lower())[:10]
+        fp = lambda s: re.sub(r"[^a-z0-9]", "", str(s).lower())[:10]   # 10‑char fingerprint
 
         for idx in final.index[final["Street Address"].isna()]:
             loc_frag = str(final.at[idx, "Location"]).lower().strip()
@@ -271,8 +288,7 @@ class ProviderLocationPipeline:
             for col in addr_cols:
                 final.at[idx, col] = winner[col]
 
-        # 3️⃣ housekeeping
-        # (ensure LOC DBA NAME never leaks; already dropped above, but safe)
+        # 3) housekeeping
         if "LOC DBA NAME" in final.columns:
             final = final.drop(columns="LOC DBA NAME")
 
